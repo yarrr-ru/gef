@@ -150,7 +150,7 @@ class Gef:
 
     @expose
     def makename(self, address, name):
-        """ MakeName(int addr, string name]) => None
+        """ makename(int addr, string name]) => None
         Set the location pointed by `address` with the name specified as argument.
         Example: ida MakeName 0x4049de __entry_point
         """
@@ -159,7 +159,7 @@ class Gef:
 
     @expose
     def jump(self, address):
-        """ Jump(int addr) => None
+        """ jump(int addr) => None
         Move the IDA EA pointer to the address pointed by `addr`.
         Example: ida Jump 0x4049de
         """
@@ -174,7 +174,7 @@ class Gef:
 
     @expose
     def importstruct(self, struct_name):
-        """ ImportStruct(string name) => dict
+        """ importstruct(string name) => dict
         Import an IDA structure in GDB which can be used with the `pcustom`
         command.
         Example: ida ImportStruct struct_1
@@ -186,7 +186,7 @@ class Gef:
 
     @expose
     def importstructs(self):
-        """ ImportStructs() => dict
+        """ importstructs() => dict
         Import all structures from the current IDB into GDB, to be used with the `pcustom`
         command.
         Example: ida ImportStructs

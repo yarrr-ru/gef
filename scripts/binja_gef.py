@@ -30,21 +30,30 @@ HL_NO_COLOR = enums.HighlightStandardColor.NoHighlightColor
 HL_BP_COLOR = enums.HighlightStandardColor.RedHighlightColor
 HL_CUR_INSN_COLOR = enums.HighlightStandardColor.GreenHighlightColor
 
-started = False
-t = None
 _breakpoints = set()
-_current_instruction = 0
+srv = None
+
 
 PAGE_SZ = 0x1000
 
+
+def dbg(x):
+    if DEBUG:
+        log_info("[*] {}".format(x))
+    return
+
+
+def ok(x):
+    log_info("[+] {}".format(x))
+    return
+
+
 def expose(f):
-    "Decorator to set exposed flag on a function."
     f.exposed = True
     return f
 
 
 def is_exposed(f):
-    "Test whether another function should be publicly exposed."
     return getattr(f, 'exposed', False)
 
 
@@ -60,9 +69,18 @@ class Gef:
     def __init__(self, server, bv, *args, **kwargs):
         self.server = server
         self.view = bv
-        self.base = bv.entry_point & ~(PAGE_SZ-1)
+        self.base = self.view.start
+        self.text_base = self.view.sections[".text"].start
         self._version = ("Binary Ninja", core_version)
         self.old_bps = set()
+        self.runtime_info = {
+            "path": "",
+            "is_pie": False,
+            "pc": 0,
+            "page_base": 0,
+            "text_base": 0,
+        }
+        self.pc = 0
         return
 
 
@@ -74,8 +92,7 @@ class Gef:
         if not is_exposed(func):
             raise NotImplementedError('Method "%s" is not exposed' % method)
 
-        if DEBUG:
-            log_info("[+] Executing %s(%s)" % (method, params))
+        dbg("Executing %s%s" % (method, params))
         return func(*params)
 
 
@@ -99,108 +116,200 @@ class Gef:
         return inspect.getdoc(f)
 
 
+    def get_va(self, offset, convert_to_int=True):
+        if convert_to_int:
+            offset = long(offset, 16) if ishex(offset) else long(offset)
+        va = offset
+        if self.runtime_info["is_pie"]:
+            va += self.text_base
+        return va
+
+
+    def get_offset(self, address, convert_to_int=True):
+        if convert_to_int:
+            address = long(address, 16) if ishex(address) else long(address)
+        offset = address
+        if self.runtime_info["is_pie"]:
+            offset -= self.runtime_info["text_base"] - self.runtime_info["page_base"]
+        return address
+
+
     @expose
     def shutdown(self):
         """ shutdown() => None
         Cleanly shutdown the XML-RPC service.
-        Example: binaryninja shutdown
+        Example: binaryninja-interact shutdown
         """
         self.server.server_close()
-        log_info("[+] XMLRPC server stopped")
+        ok("XMLRPC server stopped")
         setattr(self.server, "shutdown", True)
-        return 0
+        return
 
     @expose
     def version(self):
         """ version() => None
         Return a tuple containing the tool used and its version
-        Example: binaryninja version
+        Example: binaryninja-interact version
         """
         return self._version
 
     @expose
     def jump(self, address):
-        """ Jump(int addr) => None
+        """ jump(int addr) => None
         Move the EA pointer to the address pointed by `addr`.
-        Example: binaryninja Jump 0x4049de
+        Example: binaryninja-interact jump 0x4049de
         """
-        addr = long(address, 16) if ishex(address) else long(address)
+        # convert to offset from text base
+        off = self.get_offset(address, convert_to_int=True)
+        addr = self.get_va(off, convert_to_int=False)
+        dbg("set cursor to %#x (+%#x)" % (addr, off))
         return self.view.file.navigate(self.view.file.view, addr)
 
     @expose
     def makecomm(self, address, comment):
-        """ MakeComm(int addr, string comment) => None
+        """ makecomm(int addr, string comment) => None
         Add a comment at the location `address`.
-        Example: binaryninja MakeComm 0x40000 "Important call here!"
+        Example: binaryninja-interact makecomm 0x40000 "Important call here!"
         """
-        addr = long(address, 16) if ishex(address) else long(address)
+        off = self.get_offset(address)
+        addr = self.get_va(off)
         start_addr = self.view.get_previous_function_start_before(addr)
         func = self.view.get_function_at(start_addr)
         return func.set_comment(addr, comment)
 
     @expose
     def setcolor(self, address, color='0xff0000'):
-        """ SetColor(int addr [, int color]) => None
+        """ setcolor(int addr [, int color]) => None
         Set the location pointed by `address` with `color`.
-        Example: binaryninja SetColor 0x40000 0xff0000
+        Example: binaryninja-interact setcolor 0x40000 0xff0000
         """
-        addr = long(address, 16) if ishex(address) else long(address)
+        off = self.get_offset(address, True)
+        addr = self.get_va(off, False)
         color = long(color, 16) if ishex(color) else long(color)
         R,G,B = (color >> 16)&0xff, (color >> 8)&0xff, (color&0xff)
         color = highlight.HighlightColor(red=R, blue=G, green=B)
         return hl(self.view, addr, color)
 
     @expose
-    def sync(self, off, added, removed):
-        """ Sync(off, added, removed) => None
-        Synchronize debug info with gef. This is an internal function. It is
-        not recommended using it from the command line.
+    def collectruntimeinfo(self, _type, _value):
+        """ collectprocessinfo(_type, _value) => None
+        This is an internal function which is automatically used by GEF.
+        Do not use it from the command line.
         """
-        global _breakpoints, _current_instruction
+        if _type == "pc":                     _value = long(_value, 16)
+        elif _type == "page_base":            _value = long(_value, 16)
+        elif _type == "text_base":            _value = long(_value, 16)
+        dbg("setting runtime_info['{}'] : {}".format(_type, _value))
+        self.runtime_info[_type] = _value
+        return
 
-        # we use long() for pc because if using 64bits binaries might create
-        # OverflowError for XML-RPC service
-        off = long(off, 16) if ishex(off) else long(off)
-        pc = self.base + off
-        if DEBUG: log_info("[*] current_pc=%#x , old_pc=%#x" % (pc, _current_instruction))
+    @expose
+    def synchronize(self, off, added, removed):
+        """ synchronize(off, added, removed) => None
+        Synchronize debug info with gef. This is an internal function which is
+        automatically used by GEF if ida-interact.sync_cursor setting is True.
+        It is not recommended using it from the command line.
+        """
+        global _breakpoints
 
-        # unhighlight the _current_instruction
-        if _current_instruction > 0:
-            hl(self.view, _current_instruction, HL_NO_COLOR)
-        hl(self.view, pc, HL_CUR_INSN_COLOR)
+        cur_pc = self.pc            # the current value of $PC stored by Binja
+        new_pc = self.get_va(off)   # the new value of $PC sent by GDB
+        dbg("cur_pc=%#x , new_pc=%#x" % (cur_pc, new_pc))
 
-        # update the _current_instruction
-        _current_instruction = pc
+        # unhighlight the current instruction
+        if cur_pc:
+            hl(self.view, cur_pc, HL_NO_COLOR)
 
-        if DEBUG:
-            log_info("[*] pre-gdb-add-breakpoints: %s" % (added,))
-            log_info("[*] pre-gdb-del-breakpoints: %s" % (removed,))
-            log_info("[*] pre-binja-breakpoints: %s" % (_breakpoints))
+        # color the new one
+        hl(self.view, new_pc, HL_CUR_INSN_COLOR)
 
-        bn_added = [ x-self.base for x in _breakpoints if x not in self.old_bps ]
-        bn_removed = [ x-self.base for x in self.old_bps if x not in _breakpoints ]
+        # update the current instruction
+        self.pc = new_pc
+
+        dbg("pre-gdb-add-breakpoints: %s" % (added,))
+        dbg("pre-gdb-del-breakpoints: %s" % (removed,))
+        dbg("pre-binja-breakpoints: %s" % (_breakpoints))
+
+        bp_added = [ x-self.base for x in _breakpoints if x not in self.old_bps ]
+        bp_removed = [ x-self.base for x in self.old_bps if x not in _breakpoints ]
 
         for bp in added:
-            gef_add_breakpoint_to_list(self.view, self.base + bp)
+            gef_add_breakpoint_to_list(self.view, self.get_va(bp))
 
         for bp in removed:
-            gef_del_breakpoint_from_list(self.view, self.base + bp)
+            gef_del_breakpoint_from_list(self.view, self.get_va(bp))
 
         self.old_bps = copy.deepcopy(_breakpoints)
 
-        if DEBUG:
-            log_info("[*] post-gdb-add-breakpoints: %s" % (bn_added,))
-            log_info("[*] post-gdb-del-breakpoints: %s" % (bn_removed,))
-            log_info("[*] post-binja-breakpoints: %s" % (_breakpoints,))
-        return [bn_added, bn_removed]
+        dbg("post-gdb-add-breakpoints: %s" % (bp_added,))
+        dbg("post-gdb-del-breakpoints: %s" % (bp_removed,))
+        dbg("post-binja-breakpoints: %s" % (_breakpoints,))
+
+        return [bp_added, bp_removed]
 
 
 class RequestHandler(SimpleXMLRPCRequestHandler):
     rpc_paths = ("/RPC2",)
 
 
+class GefRpcServer:
+    def __init__(self, bv, host="0.0.0.0", port=1337):
+        self.bv = bv
+        self.host = host
+        self.port = port
+        self.url = "http://{:s}:{:d}".format(self.host, self.port)
+        self.server = SimpleXMLRPCServer(
+            (self.host, self.port),
+            requestHandler=RequestHandler,
+            logRequests=False,
+            allow_none=True
+        )
+        self.serve_forever = self.server.serve_forever
+        self.list_methods = self.server.system_listMethods
+        self.handle_request = self.server.handle_request
+        self.register_instance = self.server.register_instance
+        self.register_function = self.server.register_function
+        self.register_introspection_functions = self.server.register_introspection_functions
+        self.is_running = False
+        self.register_introspection_functions()
+        self.register_instance(Gef(self, self.bv))
+        ok("Registered {} functions.".format( len(self.list_methods()) ))
+        return
+
+    def start(self):
+        self.service = threading.Thread(target=self.start_service)
+        self.service.daemon = True
+        self.service.start()
+        self.is_running = True
+        return
+
+    def start_service(self):
+        ok("Starting service on {}:{}".format(self.host, self.port))
+        while True:
+            if hasattr(self, "shutdown") and self.shutdown==True:
+                ok("Stopping service")
+                break
+            self.handle_request()
+        return
+
+    def stop(self):
+        self.service.join()
+        self.service = None
+        self.is_running = False
+        ok("Server stopped")
+        return
+
+
+class GefRpcClient:
+    def __init__(self, url):
+        self._xmlrpc_server_proxy = xmlrpclib.ServerProxy(url)
+        return
+
+    def __getattr__(self, name):
+        return getattr(self._xmlrpc_server_proxy, name)
+
+
 def hl(bv, addr, color):
-    if DEBUG: log_info("[*] hl(%#x, %s)" % (addr, color))
     start_addr = bv.get_previous_function_start_before(addr)
     func = bv.get_function_at(start_addr)
     if func is None: return
@@ -208,57 +317,39 @@ def hl(bv, addr, color):
     return
 
 
-def start_service(host, port, bv):
-    log_info("[+] Starting service on {}:{}".format(host, port))
-    server = SimpleXMLRPCServer((host, port),
-                                requestHandler=RequestHandler,
-                                logRequests=False,
-                                allow_none=True)
-    server.register_introspection_functions()
-    server.register_instance(Gef(server, bv))
-    log_info("[+] Registered {} functions.".format( len(server.system_listMethods()) ))
-    while True:
-        if hasattr(server, "shutdown") and server.shutdown==True: break
-        server.handle_request()
-    return
-
-
-def gef_start(bv):
-    global t, started
-    t = threading.Thread(target=start_service, args=(HOST, PORT, bv))
-    t.daemon = True
-    log_info("[+] Creating new thread {}".format(t.name))
-    t.start()
-
-    if not started:
-        create_binja_menu()
-        started = True
-    return
-
-
-def gef_stop(bv):
-    global t
-    t.join()
-    t = None
-    log_info("[+] Server stopped")
-    return
-
-
 def gef_start_stop(bv):
-    if t is None:
-        gef_start(bv)
-        show_message_box("GEF", "Service successfully started, you can now have gef connect to it",
-                         MessageBoxButtonSet.OKButtonSet, MessageBoxIcon.InformationIcon)
+    global srv
 
-    else:
-        try:
-            cli = xmlrpclib.ServerProxy("http://{:s}:{:d}".format(HOST, PORT))
+    if srv is None:
+        srv = GefRpcServer(bv, HOST, PORT)
+        srv.start()
+
+        if srv.is_running:
+            create_binja_menu()
+
+        show_message_box(
+            "GEF",
+            "Service successfully started, you can set up gef to connect to it",
+            MessageBoxButtonSet.OKButtonSet,
+            MessageBoxIcon.InformationIcon
+        )
+        return
+
+    try:
+        if srv.is_running:
+            # try to stop gently
+            cli = GefRpcClient(srv.url)
             cli.shutdown()
-        except socket.error:
-            pass
-        gef_stop(bv)
-        show_message_box("GEF", "Service successfully stopped",
-                         MessageBoxButtonSet.OKButtonSet, MessageBoxIcon.InformationIcon)
+    except socket.error:
+        pass
+
+    srv.stop()
+    show_message_box(
+        "GEF",
+        "Service successfully stopped",
+        MessageBoxButtonSet.OKButtonSet,
+        MessageBoxIcon.InformationIcon
+    )
     return
 
 
@@ -266,7 +357,7 @@ def gef_add_breakpoint_to_list(bv, addr):
     global  _breakpoints
     if addr in _breakpoints: return False
     _breakpoints.add(addr)
-    log_info("[+] Breakpoint %#x added" % addr)
+    ok("Breakpoint %#x added" % addr)
     hl(bv, addr, HL_BP_COLOR)
     return True
 
@@ -275,17 +366,16 @@ def gef_del_breakpoint_from_list(bv, addr):
     global _breakpoints
     if addr not in _breakpoints: return False
     _breakpoints.discard(addr)
-    log_info("[+] Breakpoint %#x removed" % addr)
+    ok("Breakpoint %#x removed" % addr)
     hl(bv, addr, HL_NO_COLOR)
     return True
 
 
 def create_binja_menu():
-    # Binja does not really support menu in its GUI just yet
-    PluginCommand.register_for_address("gef : add breakpoint",
+    PluginCommand.register_for_address("[gef] add breakpoint",
                                        "Add a breakpoint in gef at the specified location.",
                                        gef_add_breakpoint_to_list)
-    PluginCommand.register_for_address("gef : delete breakpoint",
+    PluginCommand.register_for_address("[gef] delete breakpoint",
                                        "Remove a breakpoint in gef at the specified location.",
                                        gef_del_breakpoint_from_list)
     return

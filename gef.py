@@ -4832,6 +4832,15 @@ class ChangeFdCommand(GenericCommand):
         return int(res.split()[2], 0)
 
 
+class GefRpcClient:
+    def __init__(self, url):
+        self._xmlrpc_server_proxy = xmlrpclib.ServerProxy(url)
+        return
+
+    def __getattr__(self, name):
+        return getattr(self._xmlrpc_server_proxy, name)
+
+
 @register_command
 class IdaInteractCommand(GenericCommand):
     """IDA Interact: set of commands to interact with IDA via a XML RPC service
@@ -4850,7 +4859,6 @@ class IdaInteractCommand(GenericCommand):
         self.add_setting("host", host, "IP address to use connect to IDA/Binary Ninja script")
         self.add_setting("port", port, "Port to use connect to IDA/Binary Ninja script")
         self.add_setting("sync_cursor", False, "Enable real-time $pc synchronisation")
-
         self.sock = None
         self.version = ("", "")
         self.old_bps = set()
@@ -4872,10 +4880,20 @@ class IdaInteractCommand(GenericCommand):
         port = port or self.get_setting("port")
 
         try:
-            sock = xmlrpclib.ServerProxy("http://{:s}:{:d}".format(host, port))
+            sock = GefRpcClient("http://{:s}:{:d}".format(host, port))
             gef_on_stop_hook(ida_synchronize_handler)
             gef_on_continue_hook(ida_synchronize_handler)
             self.version = sock.version()
+            fpath = get_filepath()
+            sec = checksec(fpath)
+            base = min([x.page_start for x in get_process_maps() if x.path == fpath])
+            text = [x.page_start for x in get_info_sections() if x.path == ".text"][0]
+            sock.collectruntimeinfo("path", fpath)
+            sock.collectruntimeinfo("is_pie", sec["PIE"])
+            sock.collectruntimeinfo("page_base", hex(base))
+            sock.collectruntimeinfo("text_base", hex(text))
+            sock.collectruntimeinfo("pc", hex(current_arch.pc))
+
         except ConnectionRefusedError:
             err("Failed to connect to '{:s}:{:d}'".format(host, port))
             sock = None
@@ -4889,8 +4907,11 @@ class IdaInteractCommand(GenericCommand):
         return
 
     def do_invoke(self, argv):
+
         def parsed_arglist(arglist):
             args = []
+            is_pie = checksec(get_filepath())["PIE"]
+
             for arg in arglist:
                 try:
                     # try to solve the argument using gdb
@@ -4899,7 +4920,6 @@ class IdaInteractCommand(GenericCommand):
                     # check if value is addressable
                     argval = long(argval) if argval.address is None else long(argval.address)
                     # if the bin is PIE, we need to substract the base address
-                    is_pie = checksec(get_filepath())["PIE"]
                     if is_pie and main_base_address <= argval < main_end_address:
                         argval -= main_base_address
                     args.append("{:#x}".format(argval,))
@@ -4915,17 +4935,21 @@ class IdaInteractCommand(GenericCommand):
                 self.disconnect()
                 return
 
-        if len(argv) == 0 or argv[0] in ("-h", "--help"):
-            method_name = argv[1] if len(argv)>1 else None
-            self.usage(method_name)
+        if len(argv) == 0:
+            self.usage()
             return
+
 
         method_name = argv[0].lower()
         if method_name == "version":
             self.version = self.sock.version()
-            info("Enhancing {:s} with {:s} (v.{:s})".format(Color.greenify("gef"),
+            info("Using {:s} + {:s} (v.{:s})".format(Color.greenify("gef"),
                                                             Color.redify(self.version[0]),
                                                             Color.yellowify(self.version[1])))
+            return
+
+        if method_name == "synchronize":
+            warn("`synchonize` command cannot be called directly, use `sync` ")
             return
 
         if not is_alive():
@@ -4952,8 +4976,7 @@ class IdaInteractCommand(GenericCommand):
                     gef_print(str(res))
 
             if self.get_setting("sync_cursor") is True:
-                jump = getattr(self.sock, "Jump")
-                jump(hex(current_arch.pc-main_base_address),)
+                self.sock.jump(hex(current_arch.pc))
 
         except socket.error:
             self.disconnect()
@@ -4988,7 +5011,7 @@ class IdaInteractCommand(GenericCommand):
 
         try:
             # it is possible that the server was stopped between now and the last sync
-            rc = self.sock.Sync("{:#x}".format(pc-base_address), list(added), list(removed))
+            rc = self.sock.synchronize("{:#x}".format(pc-base_address), list(added), list(removed))
         except ConnectionRefusedError:
             self.disconnect()
             return
