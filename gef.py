@@ -96,17 +96,7 @@ if PYTHON_MAJOR == 2:
 
     # Compat Py2/3 hacks
     def range(*args):
-        """Replace range() builtin with an iterator version."""
-        if len(args) < 1:
-            raise TypeError()
-        start, end, step = 0, args[0], 1
-        if len(args) == 2: start, end = args
-        if len(args) == 3: start, end, step = args
-        n = start
-        while True:
-            if (step>0 and n >= end) or (step<0 and n<=end): break
-            yield n
-            n += step
+        return xrange(*args)
 
     FileNotFoundError = IOError #pylint: disable=redefined-builtin
     ConnectionRefusedError = socket.error #pylint: disable=redefined-builtin
