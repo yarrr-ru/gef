@@ -102,9 +102,11 @@ if PYTHON_MAJOR == 2:
         start, end, step = 0, args[0], 1
         if len(args) == 2: start, end = args
         if len(args) == 3: start, end, step = args
-        for n in itertools.count(start=start, step=step):
+        n = start
+        while True:
             if (step>0 and n >= end) or (step<0 and n<=end): break
             yield n
+            n += step
 
     FileNotFoundError = IOError #pylint: disable=redefined-builtin
     ConnectionRefusedError = socket.error #pylint: disable=redefined-builtin
